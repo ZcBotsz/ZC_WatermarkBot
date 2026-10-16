@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: ultra-watermark-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: WORKER_COUNT
+        value: 3
+      - key: MAX_QUEUE
+        value: 50
