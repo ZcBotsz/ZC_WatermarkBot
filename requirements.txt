@@ -1,0 +1,9 @@
+pyrofork==2.3.69
+tgcrypto-pyrofork
+pillow>=11
+pymupdf>=1.24
+aiosqlite
+aiohttp
+psutil
+python-dotenv
+uvloop; sys_platform != "win32"
