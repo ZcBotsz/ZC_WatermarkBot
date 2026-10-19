@@ -1,0 +1,24 @@
+ZC Watermark Bot — current Render package
+
+This package contains the current production source and runtime assets. It includes the tested UI/PDF/font changes and a first owner-only channel-automation workflow.
+
+User processing and settings:
+- `/start` is a plain text menu sent as a new message, never a reply and never a photo.
+- Back navigation is available on settings/help/plans/usage/admin screens; Close actions are removed.
+- Background Box has explicit ON and OFF controls.
+- PDFs support a separate `pdf_text` override; blank/inherit uses the general watermark text. Visual style remains shared.
+- Font picker rescans bundled/user/system font directories; Docker checks for bundled `assets/fonts/Poppins-Bold.ttf`.
+- Static video watermark coordinates align to even pixels to reduce chroma-alignment jitter. Use Static to avoid intentional motion. Actual playback still needs a sample-video check.
+- Progress cards show task number, stage, progress, bytes, throughput, ETA, elapsed time, upload destination, engine, and user/automation identity.
+- Video/PDF encoding uses one shared sequential watermark worker by default.
+
+Channel automation:
+- Owner-only **Channel Automation** screen in Admin Panel; source/target selection is by forwarded channel post or `@username`/numeric ID.
+- Permission check requires the bot to be an administrator in the source and to have posting rights in the target.
+- New supported source posts are queued while automation is running. Photos are forwarded unchanged; video/PDF files use the owner's current watermark settings and are uploaded as new posts.
+- Automated watermarked files keep the source caption and base filename where possible, regardless of personal caption/name preferences. Video output selects the same MP4/MKV container where supported and falls back to a compatible MP4/MKV container for other inputs.
+- Old posts are added by manually forwarding them while Backfill mode is active. Backfill holds processing while new channel posts are also queued, then releases the queue by oldest source-message ID. The bot-token session does not fetch full old channel history.
+- Queue state and deduplication IDs are stored in SQLite. Pause finishes the current item and retains pending items; Retry failed and Skip failed controls are available.
+- Source edits are ignored; NSFW screening is not included; media albums are handled per message.
+
+Render: use one Docker Background Worker per bot token. Include the complete `assets/` directory and commit source changes to the branch Render deploys. Mount persistent storage at `/data` if database/session persistence is required. No Render or Telegram deployment was performed from this workspace.
