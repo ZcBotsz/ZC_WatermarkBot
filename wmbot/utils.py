@@ -24,9 +24,10 @@ def humantime(sec: float) -> str:
 
 
 def bar(frac: float, width: int = 12) -> str:
+    """Compact square progress bar used inside Telegram's monospace status cards."""
     frac = max(0.0, min(1.0, frac))
     full = int(round(frac * width))
-    return "▰" * full + "▱" * (width - full)
+    return "■" * full + "□" * (width - full)
 
 
 def esc(s: str) -> str:
