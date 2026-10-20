@@ -1,0 +1,370 @@
+"""User commands, compact menu, previews and queue controls."""
+from __future__ import annotations
+
+import asyncio
+import io
+import platform
+import time
+
+import psutil
+from PIL import Image, ImageDraw
+from pyrogram import Client, filters
+from pyrogram.enums import ChatType, ParseMode
+from pyrogram.handlers import MessageHandler
+from pyrogram.types import Message
+
+from .. import __version__, config, fonts, ui
+from ..db import db
+from ..render import apply_to_image, sample_canvas
+from ..tgio import (
+    markup, reply_photo as tgreply_photo, reply_text as tgreply_text,
+    send_animation as tgsend_animation, send_message as tgsend_message,
+    send_photo as tgsend_photo, safe_edit,
+)
+from ..utils import esc, free_disk_gb, humanbytes, humantime
+from . import access
+from .ctx import ctx
+
+H = ParseMode.HTML
+
+HELP = (
+    "✨ <b>Watermark help</b>\n\n"
+    "🎬 Videos and 📄 PDFs · text-only watermarks. Send a file, or use <code>/ddl URL</code> for a direct link.\n\n"
+    "🎨 <b>Clarity tip:</b> use full opacity and turn Shadow off for crisp text. For a soft center mark, disable the box and choose Static, Center, and 20–30% text opacity.\n\n"
+    "⚙️ <b>Design</b>\n"
+    "<code>/settings</code> — text, font, color, position and output\n"
+    "<code>/setwm text</code> — set watermark text\n"
+    "<code>/preview</code> — preview the current design\n\n"
+    "📊 <b>Account & jobs</b>\n"
+    "<code>/plans</code>, <code>/myplan</code>, <code>/usage</code> — plan and limits\n"
+    "<code>/queue</code>, <code>/cancel</code> — view or stop jobs\n"
+    "<code>/status</code> — server status · <code>/id</code> — your Telegram ID\n\n"
+    "👥 Group jobs use one shared processing queue and are sent to your private chat when possible. "
+    "Open the bot once with <code>/start</code> to allow private delivery.\n\n"
+    "📡 <code>/automation</code> — your own source→target channel automation (Infinity plan). "
+    "Only videos/PDFs are watermarked; other posts are copied without a Forwarded-from tag."
+)
+
+
+def is_owner(uid: int) -> bool:
+    return bool(config.OWNER_ID and uid == config.OWNER_ID)
+
+
+async def has_automation_access(uid: int) -> bool:
+    """Owner, plus any user on the Infinity plan (each gets their own automation)."""
+    if is_owner(uid):
+        return True
+    try:
+        plan, _ = await db.plan_state(uid)
+    except Exception:
+        return False
+    return plan == "infinity"
+
+
+async def _main_rows(uid: int) -> list[list[tuple[str, str] | tuple[str, str, str]]]:
+    rows = [
+        [("⚙️ Settings", "open:m", "primary"), ("💎 Plans", "open:plans", "primary")],
+        [("👤 My Plan", "open:myplan", "primary"), ("📊 Usage", "open:usage", "primary")],
+        [("❔ Help", "open:help", "primary"), ("💬 Contact Admin", "url:https://t.me/ZCYT_2026", "primary")],
+        [("📣 Channel", "url:https://t.me/ZCYT_20266", "primary")],
+    ]
+    if await has_automation_access(uid):
+        rows.append([("📡 Channel Automation", "auto:home", "primary")])
+    if is_owner(uid):
+        rows.append([("🛠️ Admin Panel", "open:admin", "primary")])
+    return rows
+
+
+def _start_caption(name: str) -> str:
+    return (f"👋 <b>Hi {name}!</b>\n\n"
+            "✨ I add text watermarks to 🎬 videos and 📄 PDFs.\n\n"
+            "Send a video or PDF to begin, or open ⚙️ <b>Settings</b> to design your watermark.")
+
+
+async def restore_home(message: Message, uid: int):
+    """Return an edited menu card to the personal /start screen without creating a reply-chain."""
+    profile = await db.user_profile(uid)
+    name = esc((profile or {}).get("name") or "there")
+    text = _start_caption(name)
+    editor = message.edit_caption if getattr(message, "photo", None) else message.edit_text
+    await safe_edit(editor, text, parse_mode=H, reply_markup=markup(await _main_rows(uid)))
+    ctx.menu_owner[(message.chat.id, message.id)] = uid
+
+
+async def _deny(message: Message):
+    if message.chat.type == ChatType.PRIVATE:
+        await tgreply_text(message, access.deny_text(message.from_user.id if message.from_user else 0), parse_mode=H)
+
+
+async def gate(message: Message) -> bool:
+    if message.from_user:
+        await db.touch_user(message.from_user.id, message.from_user.first_name or "")
+    if not access.allowed(message.from_user, message.chat):
+        await _deny(message)
+        return False
+    return True
+
+
+async def open_menu(message: Message, uid: int, which: str = "m"):
+    if which != "m":
+        which = "m"
+    s = await db.get_settings(uid)
+    text, rows = ui.main_menu(s)
+    sent = await tgreply_text(message, text, parse_mode=H, reply_markup=markup(rows))
+    ctx.menu_owner[(sent.chat.id, sent.id)] = uid
+    if len(ctx.menu_owner) > 2000:
+        ctx.menu_owner.pop(next(iter(ctx.menu_owner)))
+
+
+_loader_file_id: str | None = None   # Telegram file_id of the loading animation, once uploaded
+
+
+async def start_cmd(client: Client, message: Message):
+    if not await gate(message):
+        return
+    uid = message.from_user.id
+    name = esc(message.from_user.first_name or "there")
+    text = _start_caption(name)
+    rows = await _main_rows(uid)
+    chat_id = message.chat.id
+
+    # 1) Brief loading animation (the supplied Rose Three loader, as a Telegram GIF),
+    #    then it is removed so only the final menu card remains. Standalone messages:
+    #    never a reply/quote of the /start command.
+    global _loader_file_id
+    loader_msg = None
+    if config.START_LOADER.exists():
+        try:
+            loader_msg = await tgsend_animation(
+                client, chat_id, _loader_file_id or str(config.START_LOADER),
+                caption="⏳ Loading…", parse_mode=H)
+            file_id = getattr(getattr(loader_msg, "animation", None), "file_id", None)
+            if file_id:
+                _loader_file_id = file_id
+        except Exception:
+            loader_msg = None
+    if loader_msg is not None:
+        await asyncio.sleep(config.START_LOADER_SECONDS)
+        try:
+            await loader_msg.delete()
+        except Exception:
+            pass
+
+    # 2) Final menu: supplied start photo + greeting caption + buttons.
+    sent = None
+    if config.START_BANNER.exists():
+        try:
+            sent = await tgsend_photo(client, chat_id, str(config.START_BANNER),
+                                      caption=text, parse_mode=H, reply_markup=markup(rows))
+        except Exception:
+            sent = None
+    if sent is None:   # photo unavailable/failed: the menu must still arrive
+        sent = await tgsend_message(client, chat_id, text, parse_mode=H,
+                                    reply_markup=markup(rows))
+    ctx.menu_owner[(sent.chat.id, sent.id)] = uid
+    if len(ctx.menu_owner) > 2000:
+        ctx.menu_owner.pop(next(iter(ctx.menu_owner)))
+
+
+async def help_cmd(client: Client, message: Message):
+    if await gate(message):
+        rows = [[("⚙️ Settings", "open:m", "primary"), ("💎 Plans", "open:plans", "primary")],
+                [("💬 Contact Admin", "url:https://t.me/ZCYT_2026", "primary")],
+                [("⬅️ Back to menu", "open:home", "primary")]]
+        sent = await tgreply_text(message, HELP, parse_mode=H, reply_markup=markup(rows))
+        ctx.menu_owner[(sent.chat.id, sent.id)] = message.from_user.id
+
+
+async def id_cmd(client: Client, message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    await tgreply_text(message, f"Your Telegram ID: <code>{uid}</code>\nChat ID: <code>{message.chat.id}</code>", parse_mode=H)
+
+
+async def settings_cmd(client: Client, message: Message):
+    if await gate(message):
+        await open_menu(message, message.from_user.id, "m")
+
+
+async def reset_cmd(client: Client, message: Message):
+    if not await gate(message):
+        return
+    text, rows = ui.confirm_reset()
+    sent = await tgreply_text(message, text, parse_mode=H, reply_markup=markup(rows))
+    ctx.menu_owner[(sent.chat.id, sent.id)] = message.from_user.id
+
+
+async def setwm_cmd(client: Client, message: Message):
+    if not await gate(message):
+        return
+    parts = (message.text or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await tgreply_text(message, "Usage: <code>/setwm @YourChannel</code>\nUse /settings for text appearance and placement.", parse_mode=H)
+        return
+    uid = message.from_user.id
+    s = await db.get_settings(uid)
+    s.set("text", parts[1].strip())
+    s.set("text_enabled", True)
+    await db.save_settings(uid, s)
+    await tgreply_text(message, f"Watermark text set to <code>{esc(s.text)}</code>. Try /preview.", parse_mode=H)
+
+
+# ── preview ──────────────────────────────────────────────────────────────────────────────
+async def _target_frame(message: Message, uid: int) -> Image.Image:
+    """A real Telegram thumbnail if available, otherwise a sample canvas."""
+    m = message.reply_to_message
+    w = h = 0
+    file_id = None
+    if m is not None:
+        if m.video:
+            w, h, th = m.video.width, m.video.height, m.video.thumbs
+            file_id = th[-1].file_id if th else None
+        elif m.animation:
+            th = m.animation.thumbs
+            file_id = th[-1].file_id if th else None
+        elif m.document and m.document.thumbs:
+            file_id = m.document.thumbs[-1].file_id
+    if file_id:
+        try:
+            bio = await ctx.app.download_media(file_id, in_memory=True)
+            img = Image.open(bio).convert("RGB")
+            if w and h:
+                k = min(1.0, 1920 / max(w, h))
+                img = img.resize((int(w * k), int(h * k)), Image.Resampling.LANCZOS)
+            return img
+        except Exception:
+            pass
+    w, h = ctx.last_dims.get(uid, (1280, 720))
+    k = min(1.0, 1280 / max(w, h))
+    return sample_canvas(int(w * k), int(h * k))
+
+
+async def send_preview(message: Message, uid: int, reply_to: Message | None = None):
+    s = await db.get_settings(uid)
+    if not s.has_visible_content:
+        await tgreply_text(message, "Set a text watermark first with /setwm or /settings.")
+        return
+    base = await _target_frame(reply_to or message, uid)
+    img = await asyncio.to_thread(apply_to_image, base, s)
+    bio = io.BytesIO()
+    img.convert("RGB").save(bio, "JPEG", quality=90)
+    bio.name = "preview.jpg"
+    bio.seek(0)
+    note = "\nMotion modes move in the video; preview shows the starting position." if s.mode in ("scroll", "bounce", "hop") else ""
+    await tgreply_photo(message, bio, caption=f"<b>Preview</b>{esc(note)}", parse_mode=H)
+
+
+async def send_pdf_preview(message: Message, uid: int):
+    from ..jobs import pdf_settings_for
+    from ..pdfmark import _pdf_settings
+
+    settings = _pdf_settings(pdf_settings_for(await db.get_settings(uid)))
+    if not settings.has_pdf_visible_content:
+        await tgreply_text(message, "Set independent PDF watermark text in /settings → PDF watermark settings first.")
+        return
+    page = Image.new("RGB", (720, 1018), "white")
+    draw = ImageDraw.Draw(page)
+    draw.rectangle((24, 24, 696, 994), outline="#D0D0D0", width=2)
+    draw.text((64, 65), "PDF SAMPLE PAGE", fill="#242424")
+    draw.text((64, 105), "Preview of your independent PDF watermark profile", fill="#555555")
+    for y in range(175, 900, 50):
+        draw.rounded_rectangle((64, y, 650 - (y % 3) * 18, y + 8), radius=4, fill="#E4E4E4")
+    img = await asyncio.to_thread(apply_to_image, page, settings)
+    bio = io.BytesIO()
+    img.convert("RGB").save(bio, "JPEG", quality=90)
+    bio.name = "pdf-preview.jpg"
+    bio.seek(0)
+    await tgreply_photo(message, bio, caption="📄 <b>PDF watermark preview</b> · sample page", parse_mode=H)
+
+
+async def preview_cmd(client: Client, message: Message):
+    if await gate(message):
+        await send_preview(message, message.from_user.id)
+
+
+# ── status / queue / cancel ──────────────────────────────────────────────────────────────
+async def status_cmd(client: Client, message: Message):
+    if not await gate(message):
+        return
+    from .. import video
+    snap = ctx.pipeline.snapshot()
+    hw = []
+    for c in ("h264", "h265"):
+        e = await video.hw_available(c)
+        if e:
+            hw.append(e)
+
+    def cpu_percent():
+        start_usage = config.cpu_usage_seconds()
+        started = time.monotonic()
+        time.sleep(0.5)
+        end_usage = config.cpu_usage_seconds()
+        elapsed = max(0.01, time.monotonic() - started)
+        if start_usage is not None and end_usage is not None and end_usage >= start_usage:
+            return min(100.0, (end_usage - start_usage) / elapsed / max(1, config.CPU_COUNT) * 100)
+        return min(100.0, psutil.Process().cpu_percent(interval=0.01) / max(1, config.CPU_COUNT))
+
+    cpu = await asyncio.to_thread(cpu_percent)
+    used, cap = config.memory_current_bytes(), config.MEMORY_LIMIT_BYTES
+    if used is not None and cap:
+        ram_line = f"🧠 Container RAM: <b>{humanbytes(used)} / {humanbytes(cap)}</b> ({used / cap * 100:.0f}%)\n"
+    else:
+        vm = psutil.virtual_memory()
+        ram_line = f"🧠 Host RAM: <b>{vm.percent:.0f}%</b> ({humanbytes(vm.available)} free)\n"
+    up = time.time() - ctx.started
+    await tgreply_text(message,
+        f"🖥️ <b>Server status</b>\n\n"
+        f"⚙️ CPU: <b>{cpu:.0f}%</b> · {config.CPU_COUNT} cores\n"
+        f"{ram_line}"
+        f"💾 Disk free: <b>{free_disk_gb(config.WORK_DIR):.1f} GB</b>\n"
+        f"⏱️ Uptime: {humantime(up)}\n\n"
+        f"🎞️ Encoders: {config.ENCODE_SLOTS} parallel · {config.FFMPEG_THREADS} threads · GPU: {', '.join(hw) or 'none (CPU x264)'}\n"
+        f"📋 Active jobs: <b>{snap['active']}</b> · {snap['by_status'] or 'idle'}\n"
+        f"✅ Completed: {snap['completed']} · ❌ Failed: {snap['failed']}\n\n"
+        f"<i>v{__version__} · Python {platform.python_version()}</i>", parse_mode=H)
+
+
+async def queue_cmd(client: Client, message: Message):
+    if not await gate(message):
+        return
+    jobs = ctx.pipeline.user_jobs(message.from_user.id)
+    pending = [j for j in ctx.pending.values() if j.user_id == message.from_user.id]
+    jobs = pending + jobs
+    if not jobs:
+        await tgreply_text(message, "You have no queued or running jobs.")
+        return
+    lines = [f"📋 <b>Your queue</b> · {len(jobs)} job(s)"]
+    rows = []
+    for j in jobs:
+        icon = "📄" if j.kind == "pdf" else "🎬"
+        lines.append(f"{icon} <code>{esc(j.file_name[:40])}</code> · {esc(j.status)}")
+        rows.append([(f"❌ Cancel {j.file_name[:24]}", f"cx:{j.id}", "danger")])
+    await tgreply_text(message, "\n".join(lines), parse_mode=H, reply_markup=markup(rows))
+
+
+async def cancel_cmd(client: Client, message: Message):
+    if not await gate(message):
+        return
+    uid = message.from_user.id
+    aw = ctx.awaiting.pop(uid, None)
+    if aw:
+        try:
+            await client.delete_messages(aw.chat_id, aw.prompt_msg_id)
+        except Exception:
+            pass
+        await tgreply_text(message, "Input cancelled.")
+        return
+    n = ctx.pipeline.cancel_user(uid)
+    pending_ids = [k for k, j in ctx.pending.items() if j.user_id == uid]
+    for jid in pending_ids:
+        job = ctx.pending.pop(jid, None)
+        if job:
+            ctx.menu_owner.pop((job.status_msg.chat.id, job.status_msg.id), None) if job.status_msg else None
+    await tgreply_text(message, f"Cancelling {n} job(s)…" if n else "Nothing to cancel.")
+
+
+def register(app: Client):
+    cmds = {"start": start_cmd, "help": help_cmd, "id": id_cmd, "settings": settings_cmd,
+            "reset": reset_cmd, "setwm": setwm_cmd, "preview": preview_cmd, "status": status_cmd,
+            "queue": queue_cmd, "cancel": cancel_cmd}
+    for name, fn in cmds.items():
+        app.add_handler(MessageHandler(fn, filters.command(name)), group=0)
