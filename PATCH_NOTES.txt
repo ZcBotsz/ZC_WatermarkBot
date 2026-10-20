@@ -1,0 +1,26 @@
+ZC Watermark Bot — current Render package
+
+This package contains the current production source and runtime assets. It includes the tested UI/PDF/font changes and a per-user channel-automation workflow (owner + Infinity plan).
+
+User processing and settings:
+- `/start` shows the supplied loading animation ("Rose Three", generated as `assets/banners/loading.gif` since Telegram cannot run HTML/JS), then sends the start photo with greeting caption and menu buttons as a fresh message, never a reply. Set `START_LOADER_SECONDS=0` to skip the wait.
+- Back navigation is available on settings/help/plans/usage/admin screens; Close actions are removed.
+- Background Box has explicit ON and OFF controls.
+- PDFs now have a fully independent watermark profile: separate text, font, size, colour, opacity, uppercase, outline, shadow, background box/border, pattern (static/tiled), position, margin and rotation. Old saved settings are migrated once (the video design is snapshotted into the PDF profile), then the two profiles never track each other. A PDF preview button renders the profile on a sample page, and PDF auto-contrast uses a true contrast check so light text cannot vanish on white pages.
+- Font picker rescans bundled/user/system font directories; Docker checks for bundled `assets/fonts/Poppins-Bold.ttf`.
+- Static video watermark coordinates align to even pixels to reduce chroma-alignment jitter. Use Static to avoid intentional motion. Actual playback still needs a sample-video check.
+- Progress cards show task number, stage, progress, bytes, throughput, ETA, elapsed time, upload destination, engine, and user/automation identity.
+- Video/PDF encoding uses one shared sequential watermark worker by default.
+
+Channel automation:
+- **Channel Automation** is open to the owner and to Infinity-plan users (`/automation`, the `/start` menu, My Plan, and the owner's Admin Panel). Every user configures their own source/target channels (by forwarded channel post or `@username`/numeric ID), their own queue, watermark settings and plan file-size limits; queues and settings are fully isolated per user and existing owner configuration/queue data migrates automatically.
+- Permission check requires the bot to be an administrator in the source and to have posting rights in the target.
+- Every new source-channel post is queued while that user's automation is running. Only video/PDF posts are watermarked with that user's current settings; all other posts (text, photos, stickers, audio/voice, and non-PDF documents) are copied unchanged to the target without a Telegram "Forwarded from" tag.
+- Automated watermarked files keep the source caption and base filename where possible, regardless of personal caption/name preferences. Video output selects the same MP4/MKV container where supported and falls back to a compatible MP4/MKV container for other inputs.
+- Old posts are added by manually forwarding them while Backfill mode is active. Backfill holds processing while new channel posts are also queued, then releases the queue by oldest source-message ID. The bot-token session does not fetch full old channel history.
+- Queue state and deduplication IDs are stored in SQLite. Pause finishes the current item and retains pending items; Retry failed and Skip failed controls are available.
+- Source edits are ignored; NSFW screening is not included; media albums are handled per message.
+
+Validation: `python -m compileall -q wmbot tests` succeeded; the full local test suite passed **108 tests**, including PDF-profile independence/migration, auto-contrast, per-user automation isolation/access, legacy-database migration, and the /start loader → photo sequence. Telegram calls were mocked; no live Telegram automation or Render deployment was performed.
+
+Render: use one Docker Background Worker per bot token. Include the complete `assets/` directory and commit source changes to the branch Render deploys. Mount persistent storage at `/data` if database/bot-session persistence is required. No Render or Telegram deployment was performed from this workspace.
