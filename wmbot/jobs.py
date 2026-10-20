@@ -151,11 +151,11 @@ class Transport(Protocol):
 # Progress card
 # ──────────────────────────────────────────────────────────────────────────────────────────
 _STAGE_INFO = {
-    "queued": (0, "⏳ Queued"),
-    "downloading": (1, "⬇️ Download"),
-    "waiting": (2, "⏳ Watermark queue"),
-    "processing": (2, "🖋️ Watermark"),
-    "uploading": (3, "⬆️ Upload"),
+    "queued": (0, " Checking"),
+    "downloading": (1, " Download"),
+    "waiting": (2, " NSFW"),
+    "processing": (2, " Watermark "),
+    "uploading": (3, " Uploading"),
 }
 
 
@@ -190,21 +190,21 @@ def render_card(job: Job, headline: str, frac: float | None = None, detail: str 
     elapsed = humantime(time.monotonic() - job.created)
     lines = [
         f"{KIND_ICON.get(job.kind, '📦')} <b>{esc(name)}</b>",
-        f"📋 <b>Tasks:</b> {max(1, job.task_number)}/{max(1, job.task_limit)}",
-        f"🧭 <b>Stage:</b> {stage_no}. {stage_label}",
+        f" <b>Tasks :</b> {max(1, job.task_number)}/{max(1, job.task_limit)}",
+        f" <b>Stage :</b> {stage_no}. {stage_label}",
     ]
     if headline:
         lines.append(f"<i>{headline}</i>")
     lines.extend([
         f"<code>[{bar(fraction, 10)}]</code> <b>{percent:.0f}%</b>",
-        f"📊 <b>Processed:</b> {processed_prefix}{humanbytes(current)} / {humanbytes(total)}",
-        f"📦 <b>Size:</b> {humanbytes(job.file_size)}",
-        f"🚀 <b>Speed:</b> {speed}",
-        f"⏳ <b>ETA:</b> {eta}",
-        f"⌛ <b>Elapsed:</b> {elapsed}",
-        f"📤 <b>Upload:</b> {destination}",
-        f"⚙️ <b>Engine:</b> {engine}",
-        f"👤 <b>User:</b> {identity}",
+        f" <b>Processed :</b> {processed_prefix}{humanbytes(current)} / {humanbytes(total)}",
+        f" <b>Size :</b> {humanbytes(job.file_size)}",
+        f" <b>Speed :</b> {speed}",
+        f" <b>ETA :</b> {eta}",
+        f" <b>Elapsed :</b> {elapsed}",
+        f" <b>Upload :</b> {destination}",
+        f" <b>Engine :</b> {engine}",
+        f" <b>User :</b> {identity}",
     ])
     if detail:
         lines.append(f"<i>{detail}</i>")
