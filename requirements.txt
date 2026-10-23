@@ -1,0 +1,9 @@
+hawkgram==1.0.9
+tgcrypto-pyrofork>=1.2.6,<=1.2.8
+pillow>=11
+pymupdf>=1.24
+aiosqlite
+aiohttp
+psutil
+python-dotenv
+uvloop; sys_platform != "win32"
